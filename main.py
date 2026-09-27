@@ -3,12 +3,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
-from google import genai
+from groq import Groq
 
 load_dotenv()
 
 app = FastAPI()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# Stores conversation history per customer
+conversations = {}
 
 @app.get("/")
 def read_root():
@@ -22,11 +25,21 @@ async def whatsapp_webhook(request: Request):
 
     print(f"Message from {sender}: {incoming_msg}")
 
-    ai_response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=f"Respond conversationally and concisely (under 300 characters) to this WhatsApp message: {incoming_msg}"
+    # Get this customer's history, or start a new one
+    history = conversations.get(sender, [
+        {"role": "system", "content": "You are a friendly business assistant chatting on WhatsApp. Keep replies conversational and under 300 characters."}
+    ])
+
+    history.append({"role": "user", "content": incoming_msg})
+
+    chat_completion = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        messages=history
     )
-    reply_text = ai_response.text[:1500]
+    reply_text = chat_completion.choices[0].message.content[:1500]
+
+    history.append({"role": "assistant", "content": reply_text})
+    conversations[sender] = history
 
     resp = MessagingResponse()
     resp.message(reply_text)
