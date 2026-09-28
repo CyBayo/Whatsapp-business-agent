@@ -13,9 +13,13 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 # Stores conversation history per customer
 conversations = {}
 
+SYSTEM_PROMPT = "You are a friendly business assistant chatting on WhatsApp. Keep replies conversational and under 300 characters."
+
+
 @app.get("/")
 def read_root():
     return {"status": "alive"}
+
 
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request):
@@ -25,18 +29,18 @@ async def whatsapp_webhook(request: Request):
 
     print(f"Message from {sender}: {incoming_msg}")
 
-    # Get this customer's history, or start a new one
-    history = conversations.get(sender, [
-        {"role": "system", "content": "You are a friendly business assistant chatting on WhatsApp. Keep replies conversational and under 300 characters."}
-    ])
-
+    history = conversations.get(sender, [{"role": "system", "content": SYSTEM_PROMPT}])
     history.append({"role": "user", "content": incoming_msg})
 
     chat_completion = client.chat.completions.create(
         model="openai/gpt-oss-20b",
         messages=history
     )
-    reply_text = chat_completion.choices[0].message.content[:1500]
+
+    raw_reply = chat_completion.choices[0].message.content
+    print(f"Raw reply: {repr(raw_reply)}")
+
+    reply_text = (raw_reply or "Sorry, I couldn't come up with a reply. Please try again!")[:1500]
 
     history.append({"role": "assistant", "content": reply_text})
     conversations[sender] = history
