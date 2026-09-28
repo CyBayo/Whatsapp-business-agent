@@ -6,7 +6,7 @@ from fastapi.responses import PlainTextResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 from groq import Groq
-from orders import get_orders
+from orders import get_orders, cancel_order
 
 load_dotenv()
 
@@ -20,10 +20,16 @@ SYSTEM_PROMPT = (
     "Keep replies short, warm and conversational (under 300 characters). "
     "For anything about orders, ALWAYS use the get_my_orders tool and only state facts it returns. "
     "Never guess or invent order details. "
-    "You must NEVER handle payments yourself: never give bank details, never confirm that a payment was received, "
-    "and never say an order is paid unless the tool data says so. "
-    "If the customer wants to pay, says they have paid, or asks about payment problems, refunds or prices, "
-    "call the notify_owner tool, then tell the customer the owner will follow up with them shortly."
+    "You must NEVER handle payments yourself: never give bank details or account numbers, "
+    "never confirm that a payment was received, and never say an order is paid unless the tool data says so. "
+    "If the customer wants to pay, says they have paid, or asks about payment, prices or refunds: "
+    "first call get_my_orders, then call notify_owner with the reason and the order_id, "
+    "then tell the customer the owner will follow up. "
+    "NEVER say you have notified or contacted the owner unless you actually called notify_owner in this turn. "
+    "If the customer clearly asks to cancel an order, call cancel_order. "
+    "You can only cancel unpaid orders; if the order is already paid, call notify_owner instead. "
+    "If it is unclear which order they mean, ask. "
+    "Never claim to have done something you have no tool for."
 )
 
 TOOLS = [
@@ -50,7 +56,32 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_order",
+            "description": "Cancel one of the customer's unpaid orders.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {"type": "string", "description": "The order ID to cancel, e.g. ORD-1001."},
+                },
+                "required": ["order_id"],
+            },
+        },
+    },
 ]
+
+# Safety net: if a message contains any of these, the owner is ALWAYS alerted.
+PAYMENT_WORDS = [
+    "pay", "paid", "payment", "transfer", "account number", "bank",
+    "refund", "receipt", "invoice", "price", "how much", "cost",
+]
+
+
+def looks_like_payment(text):
+    text = text.lower()
+    return any(word in text for word in PAYMENT_WORDS)
 
 
 def notify_owner(customer_id, reason, order_id=None):
@@ -66,10 +97,13 @@ def run_tool(name, customer_id, args):
         return get_orders(customer_id)
     if name == "notify_owner":
         return notify_owner(customer_id, args.get("reason", ""), args.get("order_id"))
+    if name == "cancel_order":
+        return cancel_order(customer_id, args.get("order_id", ""))
     return {"error": f"Unknown tool: {name}"}
 
 
 def run_agent(history, customer_id, max_steps=5):
+    tools_used = set()
     for _ in range(max_steps):
         response = client.chat.completions.create(
             model="openai/gpt-oss-20b",
@@ -79,7 +113,8 @@ def run_agent(history, customer_id, max_steps=5):
         msg = response.choices[0].message
 
         if not msg.tool_calls:
-            return msg.content or "Sorry, I couldn't come up with a reply. Please try again!"
+            reply = msg.content or "Sorry, I couldn't come up with a reply. Please try again!"
+            return reply, tools_used
 
         history.append({
             "role": "assistant",
@@ -95,6 +130,7 @@ def run_agent(history, customer_id, max_steps=5):
         })
         for tc in msg.tool_calls:
             print(f"Tool called: {tc.function.name}")
+            tools_used.add(tc.function.name)
             args = json.loads(tc.function.arguments or "{}")
             result = run_tool(tc.function.name, customer_id, args)
             history.append({
@@ -103,7 +139,7 @@ def run_agent(history, customer_id, max_steps=5):
                 "content": json.dumps(result),
             })
 
-    return "Sorry, I'm having trouble with that right now. Please try again in a moment!"
+    return "Sorry, I'm having trouble with that right now. Please try again in a moment!", tools_used
 
 
 @app.get("/")
@@ -122,11 +158,18 @@ async def whatsapp_webhook(request: Request):
     history = conversations.get(sender, [{"role": "system", "content": SYSTEM_PROMPT}])
     history.append({"role": "user", "content": incoming_msg})
 
+    tools_used = set()
     try:
-        reply_text = run_agent(history, sender)[:1500]
+        reply_text, tools_used = run_agent(history, sender)
+        reply_text = reply_text[:1500]
     except Exception as e:
         print(f"Agent error: {e}")
         reply_text = "Sorry, something went wrong on my end. Please try again in a moment!"
+
+    # Guardrail: payment-related message but the model didn't alert the owner
+    if looks_like_payment(incoming_msg) and "notify_owner" not in tools_used:
+        unpaid = [o["order_id"] for o in get_orders(sender) if o["payment_status"] == "unpaid"]
+        notify_owner(sender, f"Auto-flagged payment message: {incoming_msg}", ", ".join(unpaid) or None)
 
     print(f"Reply: {reply_text}")
 

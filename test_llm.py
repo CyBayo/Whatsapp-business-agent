@@ -8,8 +8,12 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
     ai_response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=f"Respond conversationally and concisely (under 300 characters) to this WhatsApp message: {incoming_msg}"
+        contents=f"Respond conversationally and concisely (under 300 characters) to this WhatsApp message: {incoming_msg}",
     )
-    reply_text = ai_response.text[:1500]  # safety cap under Twilio's 1600 limit
+    return ai_response.text[:1500]  # safety cap under Twilio's 1600 limit
 
 
+if __name__ == "__main__":
+    incoming_msg = "Hello! I need help with my order."
+    reply_text = generate_reply(incoming_msg)
+    print(reply_text)
