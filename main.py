@@ -1,19 +1,109 @@
 import os
+import json
+from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 from groq import Groq
+from orders import get_orders
 
 load_dotenv()
 
 app = FastAPI()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# Stores conversation history per customer
 conversations = {}
 
-SYSTEM_PROMPT = "You are a friendly business assistant chatting on WhatsApp. Keep replies conversational and under 300 characters."
+SYSTEM_PROMPT = (
+    "You are a friendly assistant for a small business, chatting with customers on WhatsApp. "
+    "Keep replies short, warm and conversational (under 300 characters). "
+    "For anything about orders, ALWAYS use the get_my_orders tool and only state facts it returns. "
+    "Never guess or invent order details. "
+    "You must NEVER handle payments yourself: never give bank details, never confirm that a payment was received, "
+    "and never say an order is paid unless the tool data says so. "
+    "If the customer wants to pay, says they have paid, or asks about payment problems, refunds or prices, "
+    "call the notify_owner tool, then tell the customer the owner will follow up with them shortly."
+)
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_my_orders",
+            "description": "Get the current customer's orders, including status, payment status and delivery details.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "notify_owner",
+            "description": "Alert the business owner. Use whenever payment is involved or a human is needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Short summary of what the customer needs."},
+                    "order_id": {"type": "string", "description": "The related order ID, if any."},
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+]
+
+
+def notify_owner(customer_id, reason, order_id=None):
+    alert = f"[{datetime.now():%Y-%m-%d %H:%M}] {customer_id} | order: {order_id or 'n/a'} | {reason}"
+    print(f"OWNER ALERT: {alert}")
+    with open("owner_alerts.txt", "a", encoding="utf-8") as f:
+        f.write(alert + "\n")
+    return {"status": "owner_notified"}
+
+
+def run_tool(name, customer_id, args):
+    if name == "get_my_orders":
+        return get_orders(customer_id)
+    if name == "notify_owner":
+        return notify_owner(customer_id, args.get("reason", ""), args.get("order_id"))
+    return {"error": f"Unknown tool: {name}"}
+
+
+def run_agent(history, customer_id, max_steps=5):
+    for _ in range(max_steps):
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=history,
+            tools=TOOLS,
+        )
+        msg = response.choices[0].message
+
+        if not msg.tool_calls:
+            return msg.content or "Sorry, I couldn't come up with a reply. Please try again!"
+
+        history.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ],
+        })
+        for tc in msg.tool_calls:
+            print(f"Tool called: {tc.function.name}")
+            args = json.loads(tc.function.arguments or "{}")
+            result = run_tool(tc.function.name, customer_id, args)
+            history.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result),
+            })
+
+    return "Sorry, I'm having trouble with that right now. Please try again in a moment!"
 
 
 @app.get("/")
@@ -32,15 +122,13 @@ async def whatsapp_webhook(request: Request):
     history = conversations.get(sender, [{"role": "system", "content": SYSTEM_PROMPT}])
     history.append({"role": "user", "content": incoming_msg})
 
-    chat_completion = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=history
-    )
+    try:
+        reply_text = run_agent(history, sender)[:1500]
+    except Exception as e:
+        print(f"Agent error: {e}")
+        reply_text = "Sorry, something went wrong on my end. Please try again in a moment!"
 
-    raw_reply = chat_completion.choices[0].message.content
-    print(f"Raw reply: {repr(raw_reply)}")
-
-    reply_text = (raw_reply or "Sorry, I couldn't come up with a reply. Please try again!")[:1500]
+    print(f"Reply: {reply_text}")
 
     history.append({"role": "assistant", "content": reply_text})
     conversations[sender] = history
