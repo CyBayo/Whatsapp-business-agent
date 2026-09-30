@@ -6,12 +6,16 @@ from fastapi.responses import PlainTextResponse
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 from groq import Groq
+from twilio.rest import Client as TwilioClient
 from orders import get_orders, cancel_order
 
 load_dotenv()
 
 app = FastAPI()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+OWNER_NUMBER = os.getenv("OWNER_WHATSAPP_NUMBER")
+TWILIO_SANDBOX_NUMBER = "whatsapp:+14155238886"
 
 conversations = {}
 
@@ -89,8 +93,19 @@ def notify_owner(customer_id, reason, order_id=None):
     print(f"OWNER ALERT: {alert}")
     with open("owner_alerts.txt", "a", encoding="utf-8") as f:
         f.write(alert + "\n")
-    return {"status": "owner_notified"}
 
+    if OWNER_NUMBER:
+        try:
+            twilio_client.messages.create(
+                from_=TWILIO_SANDBOX_NUMBER,
+                to=OWNER_NUMBER,
+                body=f"🔔 Customer alert\nFrom: {customer_id}\nOrder: {order_id or 'n/a'}\n{reason}",
+            )
+            print("Owner notified via WhatsApp.")
+        except Exception as e:
+            print(f"Failed to WhatsApp the owner: {e}")
+
+    return {"status": "owner_notified"}
 
 def run_tool(name, customer_id, args):
     if name == "get_my_orders":
