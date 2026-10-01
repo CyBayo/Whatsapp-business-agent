@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime
+import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.messaging_response import MessagingResponse
@@ -17,7 +18,25 @@ twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_
 OWNER_NUMBER = os.getenv("OWNER_WHATSAPP_NUMBER")
 TWILIO_SANDBOX_NUMBER = "whatsapp:+14155238886"
 
-conversations = {}
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+UPSTASH_HEADERS = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+
+
+def load_history(customer_id):
+    key = f"conversation:{customer_id}"
+    resp = requests.get(f"{UPSTASH_URL}/get/{key}", headers=UPSTASH_HEADERS)
+    data = resp.json().get("result")
+    if data:
+        return json.loads(data)
+    return [{"role": "system", "content": SYSTEM_PROMPT}]
+
+
+def save_history(customer_id, history):
+    key = f"conversation:{customer_id}"
+    value = json.dumps(history)
+    requests.post(f"{UPSTASH_URL}/set/{key}", headers=UPSTASH_HEADERS, data=value)
+
 
 SYSTEM_PROMPT = (
     "You are a friendly assistant for a small business, chatting with customers on WhatsApp. "
@@ -76,7 +95,6 @@ TOOLS = [
     },
 ]
 
-# Safety net: if a message contains any of these, the owner is ALWAYS alerted.
 PAYMENT_WORDS = [
     "pay", "paid", "payment", "transfer", "account number", "bank",
     "refund", "receipt", "invoice", "price", "how much", "cost",
@@ -106,6 +124,7 @@ def notify_owner(customer_id, reason, order_id=None):
             print(f"Failed to WhatsApp the owner: {e}")
 
     return {"status": "owner_notified"}
+
 
 def run_tool(name, customer_id, args):
     if name == "get_my_orders":
@@ -170,7 +189,7 @@ async def whatsapp_webhook(request: Request):
 
     print(f"Message from {sender}: {incoming_msg}")
 
-    history = conversations.get(sender, [{"role": "system", "content": SYSTEM_PROMPT}])
+    history = load_history(sender)
     history.append({"role": "user", "content": incoming_msg})
 
     tools_used = set()
@@ -181,7 +200,6 @@ async def whatsapp_webhook(request: Request):
         print(f"Agent error: {e}")
         reply_text = "Sorry, something went wrong on my end. Please try again in a moment!"
 
-    # Guardrail: payment-related message but the model didn't alert the owner
     if looks_like_payment(incoming_msg) and "notify_owner" not in tools_used:
         unpaid = [o["order_id"] for o in get_orders(sender) if o["payment_status"] == "unpaid"]
         notify_owner(sender, f"Auto-flagged payment message: {incoming_msg}", ", ".join(unpaid) or None)
@@ -189,9 +207,10 @@ async def whatsapp_webhook(request: Request):
     print(f"Reply: {reply_text}")
 
     history.append({"role": "assistant", "content": reply_text})
-    conversations[sender] = history
+    save_history(sender, history)
 
     resp = MessagingResponse()
     resp.message(reply_text)
 
     return PlainTextResponse(str(resp), media_type="application/xml")
+    
